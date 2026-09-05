@@ -23,6 +23,7 @@ FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 FEISHU_BASE_TOKEN = os.environ.get("FEISHU_BASE_TOKEN", "WSuibMYUIaGZIhs8VpecRHIsnYz")
 FEISHU_COUPON_TABLE_ID = os.environ.get("FEISHU_COUPON_TABLE_ID", "tblzps9oCrEvTL76")
+FEISHU_SUMMARY_TABLE_ID = os.environ.get("FEISHU_SUMMARY_TABLE_ID", "tblZjHqa6HzLsyNR")
 
 BATCH_SIZE = 200  # 飞书批量创建单批上限 1000，取 200 更稳
 
@@ -139,8 +140,8 @@ def ticket_to_cell(t):
         rec["会员手机号"] = t["phone"]
     if t.get("pcCreateUserName"):
         rec["后台出票人"] = t["pcCreateUserName"]
-    if t.get("buyTicketMode"):
-        rec["购票模式"] = t["buyTicketMode"]
+    if t.get("buyTicketMode") is not None:
+        rec["购票模式"] = str(t["buyTicketMode"])
     ts_status = t.get("ticketStatus")
     if ts_status == 1:
         rec["取票状态"] = "已取票"
@@ -155,6 +156,8 @@ def ticket_to_cell(t):
     if t.get("createTime"):
         rec["销售时间"] = ts_to_ms(t.get("createTime"))
     rec["退票信息"] = "已退票" if t.get("refund") else "未退票"
+    if t.get("status"):
+        rec["订单状态"] = t["status"]
     if t.get("refundTime"):
         rec["退票时间"] = ts_to_ms(t.get("refundTime"))
     if t.get("serviceFee") is not None:
@@ -269,10 +272,14 @@ class HLXHClient:
             time.sleep(0.5)
         return all_data
 
-    def fetch_coupons(self):
+    def fetch_coupons(self, start_ts=None, end_ts=None):
         all_data, page, page_size = [], 1, 1000
         while True:
             biz = {"page": page, "pageSize": page_size, "organizationId": HLXH_ORG_ID, "grantCinemaId": ""}
+            if start_ts is not None:
+                biz["startTime"] = start_ts
+            if end_ts is not None:
+                biz["endTime"] = end_ts
             data = self._call("/cardConsume/statement.do", biz)
             rows = data.get("list") or []
             if not rows:
@@ -282,7 +289,7 @@ class HLXHClient:
             if len(all_data) >= total or len(rows) < page_size:
                 break
             page += 1
-            time.sleep(0.5)
+            time.sleep(0.3)
         return all_data
 
 
@@ -386,6 +393,59 @@ class FeishuClient:
             created += len(result["data"].get("records", []))
         return created
 
+    def fetch_summary_existing(self, table_id):
+        """查询汇总表已有记录，返回 {(日期毫秒, 影院): record_id}"""
+        url = f"{self.base}/bitable/v1/apps/{FEISHU_BASE_TOKEN}/tables/{table_id}/records"
+        params = {"page_size": 500}
+        existing = {}
+        has_more, page_token = True, ""
+        while has_more:
+            if page_token:
+                params["page_token"] = page_token
+            resp = requests.get(url, headers=self._headers(), params=params, timeout=30)
+            result = resp.json()
+            if result.get("code") != 0:
+                raise RuntimeError(f"查询汇总表失败: {result.get('msg')}")
+            for item in result["data"].get("items", []):
+                fv = item.get("fields", {})
+                date_val = fv.get("日期")
+                cinema_val = fv.get("所属影院")
+                if date_val and cinema_val:
+                    if isinstance(cinema_val, list):
+                        cinema_val = cinema_val[0].get("text", str(cinema_val[0]))
+                    existing[(int(date_val), str(cinema_val))] = item["record_id"]
+            has_more = result["data"].get("has_more", False)
+            page_token = result["data"].get("page_token", "")
+        return existing
+
+    def update_record(self, table_id, record_id, fields):
+        """更新单条记录"""
+        url = f"{self.base}/bitable/v1/apps/{FEISHU_BASE_TOKEN}/tables/{table_id}/records/{record_id}"
+        resp = requests.put(url, headers=self._headers(), json={"fields": fields}, timeout=30)
+        result = resp.json()
+        if result.get("code") != 0:
+            raise RuntimeError(f"更新记录失败: {result.get('msg')}")
+        return True
+
+    def fetch_all_records(self, table_id):
+        """分页读取表中所有记录"""
+        url = f"{self.base}/bitable/v1/apps/{FEISHU_BASE_TOKEN}/tables/{table_id}/records"
+        params = {"page_size": 500}
+        all_records = []
+        has_more, page_token = True, ""
+        while has_more:
+            if page_token:
+                params["page_token"] = page_token
+            resp = requests.get(url, headers=self._headers(), params=params, timeout=30)
+            result = resp.json()
+            if result.get("code") != 0:
+                raise RuntimeError(f"读取记录失败: {result.get('msg')}")
+            items = result["data"].get("items", [])
+            all_records.extend(items)
+            has_more = result["data"].get("has_more", False)
+            page_token = result["data"].get("page_token", "")
+        return all_records
+
 
 # 影票表字段定义（飞书 OpenAPI 格式）
 TICKET_FIELDS = [
@@ -439,8 +499,7 @@ def main():
     hlhx.login()
     tickets = hlhx.fetch_tickets(start_ts, end_ts)
     ticket_detail = [t for t in tickets if t.get("orderNo")]
-    coupons_all = hlhx.fetch_coupons()
-    coupons = [c for c in coupons_all if c.get("createTime") and start_ts <= c["createTime"] <= end_ts]
+    coupons = hlhx.fetch_coupons(start_ts, end_ts)
     print(f"[Main] 影票: {len(ticket_detail)} 条，兑换券: {len(coupons)} 条")
 
     # 2. 飞书初始化
@@ -457,19 +516,31 @@ def main():
         ticket_table_id = feishu.create_table(ticket_table_name, TICKET_FIELDS)
         print(f"[Feishu] 已创建当月表: {ticket_table_name}")
 
-    # 4. 影票去重并写入
-    existing_ticket = feishu.fetch_existing_order_nos(ticket_table_id, "订单编号")
+    # 4. 影票去重并写入（按订单编号+座位去重，避免多座位订单只导入第一条）
+    existing_records = feishu.fetch_all_records(ticket_table_id)
+    existing_ticket_keys = set()
+    for item in existing_records:
+        fv = item.get("fields", {})
+        order_no = fv.get("订单编号")
+        if isinstance(order_no, list):
+            order_no = order_no[0].get("text", "") if order_no else ""
+        seat = fv.get("座位")
+        if isinstance(seat, list):
+            seat = seat[0].get("text", "") if seat else ""
+        existing_ticket_keys.add((str(order_no), str(seat)))
     new_ticket_records = []
     for t in ticket_detail:
-        order_no = t.get("orderNo")
-        if order_no and order_no in existing_ticket:
-            continue
         cell = ticket_to_cell(t)
-        if cell:
-            new_ticket_records.append({"fields": cell})
-            if order_no:
-                existing_ticket.add(order_no)
-    print(f"[Feishu] 影票待写入: {len(new_ticket_records)} 条（已去重）")
+        if not cell:
+            continue
+        order_no = str(cell.get("订单编号", ""))
+        seat = str(cell.get("座位", ""))
+        key = (order_no, seat)
+        if order_no and key in existing_ticket_keys:
+            continue
+        new_ticket_records.append({"fields": cell})
+        existing_ticket_keys.add(key)
+    print(f"[Feishu] 影票待写入: {len(new_ticket_records)} 条（已按订单+座位去重）")
     if new_ticket_records:
         feishu.batch_create_records(ticket_table_id, new_ticket_records)
 
@@ -489,7 +560,100 @@ def main():
     if new_coupon_records:
         feishu.batch_create_records(FEISHU_COUPON_TABLE_ID, new_coupon_records)
 
-    print(f"[Main] 执行完成：影票写入 {len(new_ticket_records)} 条，兑换券写入 {len(new_coupon_records)} 条")
+    # 6. 全量重算每日汇总（从所有明细表重新计算，确保数据准确）
+    print("[Feishu] 开始全量重算汇总表...")
+    # 6a. 从所有影票明细表读取数据
+    all_tables = feishu.list_tables()
+    ticket_summary = {}  # {(日期ms, 影院): {"orders": set, "people": 0, "boxoffice": 0.0}}
+    for tname, tid in all_tables.items():
+        if not tname.startswith("影票明细_"):
+            continue
+        records = feishu.fetch_all_records(tid)
+        print(f"  读取 {tname}: {len(records)} 条")
+        for item in records:
+            fv = item.get("fields", {})
+            date_val = fv.get("放映日期")
+            cinema = fv.get("所属影院")
+            if isinstance(cinema, list):
+                cinema = cinema[0].get("text", str(cinema[0])) if cinema else None
+            if not date_val or not cinema:
+                continue
+            dt = datetime.datetime.fromtimestamp(int(date_val) / 1000, tz=CN_TZ)
+            day_ms = int(datetime.datetime.combine(dt.date(), datetime.time.min, tzinfo=CN_TZ).timestamp()) * 1000
+            key = (day_ms, str(cinema))
+            if key not in ticket_summary:
+                ticket_summary[key] = {"orders": set(), "people": 0, "boxoffice": 0.0}
+            order_no = fv.get("订单编号")
+            if order_no:
+                if isinstance(order_no, list):
+                    order_no = order_no[0].get("text", str(order_no[0]))
+                ticket_summary[key]["orders"].add(str(order_no))
+            ticket_summary[key]["people"] += 1
+            payment = fv.get("实付金额(元)")
+            if payment is not None:
+                ticket_summary[key]["boxoffice"] += float(payment)
+
+    # 6b. 从兑换券表读取数据
+    coupon_summary = {}  # {(日期ms, 影院): {"count": 0, "total": 0.0, "people": 0}}
+    coupon_records = feishu.fetch_all_records(FEISHU_COUPON_TABLE_ID)
+    print(f"  读取兑换券: {len(coupon_records)} 条")
+    for item in coupon_records:
+        fv = item.get("fields", {})
+        date_val = fv.get("兑换时间")
+        cinema = fv.get("消费影院")
+        if isinstance(cinema, list):
+            cinema = cinema[0].get("text", str(cinema[0])) if cinema else None
+        if not date_val or not cinema:
+            continue
+        dt = datetime.datetime.fromtimestamp(int(date_val) / 1000, tz=CN_TZ)
+        day_ms = int(datetime.datetime.combine(dt.date(), datetime.time.min, tzinfo=CN_TZ).timestamp()) * 1000
+        key = (day_ms, str(cinema))
+        if key not in coupon_summary:
+            coupon_summary[key] = {"count": 0, "total": 0.0, "people": 0}
+        coupon_summary[key]["count"] += 1
+        total_fee = fv.get("消费总额")
+        if total_fee is not None:
+            coupon_summary[key]["total"] += float(total_fee)
+        coupon_summary[key]["people"] += 1
+
+    # 6c. 合并并写入汇总表
+    all_keys = set(list(ticket_summary.keys()) + list(coupon_summary.keys()))
+    existing_summary = feishu.fetch_summary_existing(FEISHU_SUMMARY_TABLE_ID)
+    to_create = []
+    to_update = []
+    for key in sorted(all_keys):
+        day_ms, cinema = key
+        t_data = ticket_summary.get(key, {"orders": set(), "people": 0, "boxoffice": 0.0})
+        c_data = coupon_summary.get(key, {"count": 0, "total": 0.0, "people": 0})
+        fields = {
+            "日期": day_ms,
+            "所属影院": cinema,
+            "影票订单数": len(t_data["orders"]),
+            "影票人次": t_data["people"],
+            "影票票房": round(t_data["boxoffice"], 2),
+            "兑换券笔数": c_data["count"],
+            "兑换券总额": round(c_data["total"], 2),
+            "兑换券人次": c_data["people"],
+        }
+        if key in existing_summary:
+            to_update.append((existing_summary[key], fields))
+        else:
+            to_create.append({"fields": fields})
+
+    # 批量新增
+    created = 0
+    for i in range(0, len(to_create), 200):
+        batch = to_create[i:i+200]
+        feishu.batch_create_records(FEISHU_SUMMARY_TABLE_ID, batch)
+        created += len(batch)
+    # 逐条更新
+    updated = 0
+    for record_id, fields in to_update:
+        feishu.update_record(FEISHU_SUMMARY_TABLE_ID, record_id, fields)
+        updated += 1
+    print(f"[Feishu] 汇总全量重算: 共 {len(all_keys)} 条，新增 {created} 条，更新 {updated} 条")
+
+    print(f"[Main] 执行完成：影票写入 {len(new_ticket_records)} 条，兑换券写入 {len(new_coupon_records)} 条，汇总重算 {len(all_keys)} 条")
 
 
 if __name__ == "__main__":
