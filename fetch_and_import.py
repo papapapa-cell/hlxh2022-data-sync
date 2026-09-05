@@ -155,7 +155,8 @@ def ticket_to_cell(t):
         rec["取票号"] = t["barcodes"]
     if t.get("createTime"):
         rec["销售时间"] = ts_to_ms(t.get("createTime"))
-    rec["退票信息"] = "已退票" if t.get("refund") else "未退票"
+    is_refund = (t.get("status") == "AFTERSALE_FINISH") or (t.get("refundTime") is not None)
+    rec["退票信息"] = "已退票" if is_refund else "未退票"
     if t.get("status"):
         rec["订单状态"] = t["status"]
     if t.get("refundTime"):
