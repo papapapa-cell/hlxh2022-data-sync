@@ -2,8 +2,8 @@ name: 欢乐星会每日数据自动更新
 
 on:
   schedule:
-    # UTC 15:55 = 北京时间 23:55（GitHub Actions cron 使用 UTC）
-    - cron: '55 15 * * *'
+    # UTC 16:05 = 北京时间 00:05（GitHub Actions cron 使用 UTC）
+    - cron: '5 16 * * *'
   workflow_dispatch:  # 支持手动触发，便于首次测试
 
 jobs:
