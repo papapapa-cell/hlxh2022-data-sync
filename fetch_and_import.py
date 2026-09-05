@@ -561,13 +561,22 @@ def main():
     if new_coupon_records:
         feishu.batch_create_records(FEISHU_COUPON_TABLE_ID, new_coupon_records)
 
-    # 6. 全量重算每日汇总（从所有明细表重新计算，确保数据准确）
-    print("[Feishu] 开始全量重算汇总表...")
-    # 6a. 从所有影票明细表读取数据
+    # 6. 近三天汇总校准（只计算当天+前两天，大幅缩短运行时间）
+    print("[Feishu] 开始近三天汇总校准...")
+    today = datetime.datetime.now(CN_TZ).date()
+    recent_dates = set()
+    for i in range(3):
+        recent_dates.add(today - datetime.timedelta(days=i))
+    recent_months = set(d.strftime("%Y%m") for d in recent_dates)
+    print(f"  近三天: {sorted(recent_dates)}, 涉及月份: {sorted(recent_months)}")
+    # 6a. 只读取涉及月份的影票明细表，并筛选近三天
     all_tables = feishu.list_tables()
     ticket_summary = {}  # {(日期ms, 影院): {"orders": set, "people": 0, "boxoffice": 0.0}}
     for tname, tid in all_tables.items():
         if not tname.startswith("影票明细_"):
+            continue
+        ym = tname.replace("影票明细_", "")
+        if ym not in recent_months:
             continue
         records = feishu.fetch_all_records(tid)
         print(f"  读取 {tname}: {len(records)} 条")
@@ -580,6 +589,8 @@ def main():
             if not date_val or not cinema:
                 continue
             dt = datetime.datetime.fromtimestamp(int(date_val) / 1000, tz=CN_TZ)
+            if dt.date() not in recent_dates:
+                continue
             day_ms = int(datetime.datetime.combine(dt.date(), datetime.time.min, tzinfo=CN_TZ).timestamp()) * 1000
             key = (day_ms, str(cinema))
             if key not in ticket_summary:
@@ -594,7 +605,7 @@ def main():
             if payment is not None:
                 ticket_summary[key]["boxoffice"] += float(payment)
 
-    # 6b. 从兑换券表读取数据
+    # 6b. 从兑换券表读取数据，筛选近三天
     coupon_summary = {}  # {(日期ms, 影院): {"count": 0, "total": 0.0, "people": 0}}
     coupon_records = feishu.fetch_all_records(FEISHU_COUPON_TABLE_ID)
     print(f"  读取兑换券: {len(coupon_records)} 条")
@@ -607,6 +618,8 @@ def main():
         if not date_val or not cinema:
             continue
         dt = datetime.datetime.fromtimestamp(int(date_val) / 1000, tz=CN_TZ)
+        if dt.date() not in recent_dates:
+            continue
         day_ms = int(datetime.datetime.combine(dt.date(), datetime.time.min, tzinfo=CN_TZ).timestamp()) * 1000
         key = (day_ms, str(cinema))
         if key not in coupon_summary:
@@ -652,9 +665,9 @@ def main():
     for record_id, fields in to_update:
         feishu.update_record(FEISHU_SUMMARY_TABLE_ID, record_id, fields)
         updated += 1
-    print(f"[Feishu] 汇总全量重算: 共 {len(all_keys)} 条，新增 {created} 条，更新 {updated} 条")
+    print(f"[Feishu] 汇总近三天校准: 共 {len(all_keys)} 条，新增 {created} 条，更新 {updated} 条")
 
-    print(f"[Main] 执行完成：影票写入 {len(new_ticket_records)} 条，兑换券写入 {len(new_coupon_records)} 条，汇总重算 {len(all_keys)} 条")
+    print(f"[Main] 执行完成：影票写入 {len(new_ticket_records)} 条，兑换券写入 {len(new_coupon_records)} 条，汇总更新 {len(all_keys)} 条")
 
 
 if __name__ == "__main__":
