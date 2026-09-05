@@ -1,0 +1,36 @@
+name: 欢乐星会每日数据自动更新
+
+on:
+  schedule:
+    # UTC 15:55 = 北京时间 23:55（GitHub Actions cron 使用 UTC）
+    - cron: '55 15 * * *'
+  workflow_dispatch:  # 支持手动触发，便于首次测试
+
+jobs:
+  fetch-and-import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install requests
+
+      - name: 运行抓取并写入飞书
+        env:
+          HLXH_USERNAME: ${{ secrets.HLXH_USERNAME }}
+          HLXH_PASSWORD: ${{ secrets.HLXH_PASSWORD }}
+          HLXH_API_BASE: ${{ secrets.HLXH_API_BASE }}
+          HLXH_FIXED_TOKEN: ${{ secrets.HLXH_FIXED_TOKEN }}
+          HLXH_ORG_ID: ${{ secrets.HLXH_ORG_ID }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_BASE_TOKEN: ${{ secrets.FEISHU_BASE_TOKEN }}
+          FEISHU_COUPON_TABLE_ID: ${{ secrets.FEISHU_COUPON_TABLE_ID }}
+        run: python fetch_and_import.py
