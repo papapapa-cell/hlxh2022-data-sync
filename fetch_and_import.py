@@ -11,6 +11,7 @@ import json
 import time
 import datetime
 import requests
+from concurrent.futures import ThreadPoolExecutor
 
 # ============ 配置（从环境变量读取） ============
 HLXH_USERNAME = os.environ.get("HLXH_USERNAME", "")
@@ -543,9 +544,12 @@ def main():
     # 1. 抓取欢乐星数据
     hlhx = HLXHClient()
     hlhx.login()
-    tickets = hlhx.fetch_tickets(start_ts, end_ts)
+    with ThreadPoolExecutor(max_workers=2) as _pool:
+        _ft = _pool.submit(hlhx.fetch_tickets, start_ts, end_ts)
+        _fc = _pool.submit(hlhx.fetch_coupons, start_ts, end_ts)
+        tickets = _ft.result()
+        coupons = _fc.result()
     ticket_detail = [t for t in tickets if t.get("orderNo")]
-    coupons = hlhx.fetch_coupons(start_ts, end_ts)
     print(f"[Main] 影票: {len(ticket_detail)} 条，兑换券: {len(coupons)} 条")
     _T["1-登录+抓取后台数据"] = _time.time() - _t0; _t0 = _time.time()
 
