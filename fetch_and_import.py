@@ -495,6 +495,11 @@ def main():
     month_str = today.strftime("%Y%m")
     print(f"[Main] 目标日期: {today} (北京时间)，月份: {month_str}")
 
+    # 阶段计时
+    import time as _time
+    _T = {}
+    _t0 = _time.time()
+
     # 1. 抓取欢乐星数据
     hlhx = HLXHClient()
     hlhx.login()
@@ -502,10 +507,12 @@ def main():
     ticket_detail = [t for t in tickets if t.get("orderNo")]
     coupons = hlhx.fetch_coupons(start_ts, end_ts)
     print(f"[Main] 影票: {len(ticket_detail)} 条，兑换券: {len(coupons)} 条")
+    _T["1-登录+抓取后台数据"] = _time.time() - _t0; _t0 = _time.time()
 
     # 2. 飞书初始化
     feishu = FeishuClient()
     feishu.get_tenant_token()
+    _T["2-飞书认证"] = _time.time() - _t0; _t0 = _time.time()
 
     # 3. 影票：定位/创建当月表
     tables = feishu.list_tables()
@@ -516,6 +523,8 @@ def main():
     else:
         ticket_table_id = feishu.create_table(ticket_table_name, TICKET_FIELDS)
         print(f"[Feishu] 已创建当月表: {ticket_table_name}")
+
+    _T["3-定位当月表"] = _time.time() - _t0; _t0 = _time.time()
 
     # 4. 影票去重并写入（按订单编号+座位去重，避免多座位订单只导入第一条）
     existing_records = feishu.fetch_all_records(ticket_table_id)
@@ -544,6 +553,7 @@ def main():
     print(f"[Feishu] 影票待写入: {len(new_ticket_records)} 条（已按订单+座位去重）")
     if new_ticket_records:
         feishu.batch_create_records(ticket_table_id, new_ticket_records)
+    _T["4-影票去重+写入"] = _time.time() - _t0; _t0 = _time.time()
 
     # 5. 兑换券去重并写入
     existing_coupon = feishu.fetch_existing_order_nos(FEISHU_COUPON_TABLE_ID, "订单编号")
@@ -560,6 +570,7 @@ def main():
     print(f"[Feishu] 兑换券待写入: {len(new_coupon_records)} 条（已去重）")
     if new_coupon_records:
         feishu.batch_create_records(FEISHU_COUPON_TABLE_ID, new_coupon_records)
+    _T["5-兑换券去重+写入"] = _time.time() - _t0; _t0 = _time.time()
 
     # 6. 近三天汇总校准（只计算当天+前两天，大幅缩短运行时间）
     print("[Feishu] 开始近三天汇总校准...")
@@ -667,6 +678,14 @@ def main():
         updated += 1
     print(f"[Feishu] 汇总近三天校准: 共 {len(all_keys)} 条，新增 {created} 条，更新 {updated} 条")
 
+    _T["6-近三天汇总校准"] = _time.time() - _t0
+
+    print("[Timing] ===== 脚本内部各阶段耗时 =====")
+    _grand = 0
+    for _stage, _sec in _T.items():
+        print(f"[Timing] {_stage}: {_sec:.2f}s")
+        _grand += _sec
+    print(f"[Timing] 脚本内部合计: {_grand:.2f}s")
     print(f"[Main] 执行完成：影票写入 {len(new_ticket_records)} 条，兑换券写入 {len(new_coupon_records)} 条，汇总更新 {len(all_keys)} 条")
 
 
