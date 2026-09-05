@@ -428,6 +428,46 @@ class FeishuClient:
             raise RuntimeError(f"更新记录失败: {result.get('msg')}")
         return True
 
+    def batch_update_records(self, table_id, records):
+        """批量更新 records: [{record_id, fields}]"""
+        total = 0
+        for i in range(0, len(records), BATCH_SIZE):
+            batch = records[i:i + BATCH_SIZE]
+            url = f"{self.base}/bitable/v1/apps/{FEISHU_BASE_TOKEN}/tables/{table_id}/records/batch_update"
+            resp = requests.post(url, headers=self._headers(), json={"records": batch}, timeout=60)
+            result = resp.json()
+            if result.get("code") != 0:
+                raise RuntimeError(f"批量更新失败: {result.get('msg')} {json.dumps(result)[:300]}")
+            total += len(result["data"].get("records", []))
+        return total
+
+    def search_since(self, table_id, date_field, since_ms):
+        """用search接口只查询 date_field >= since_ms 的记录（按日期筛选，避免全表读取）"""
+        url = f"{self.base}/bitable/v1/apps/{FEISHU_BASE_TOKEN}/tables/{table_id}/records/search"
+        body = {
+            "filter": {
+                "conjunction": "and",
+                "conditions": [
+                    {"field_name": date_field, "operator": "isGreater",
+                     "value": ["ExactDate", str(since_ms)]}
+                ]
+            },
+            "page_size": 500
+        }
+        items, page_token = [], ""
+        while True:
+            params = {"page_token": page_token} if page_token else {}
+            resp = requests.post(url, headers=self._headers(), params=params, json=body, timeout=30)
+            result = resp.json()
+            if result.get("code") != 0:
+                raise RuntimeError(f"按日期查询失败: {result.get('msg')}")
+            data = result["data"]
+            items.extend(data.get("items", []))
+            if not data.get("has_more"):
+                break
+            page_token = data.get("page_token", "")
+        return items
+
     def fetch_all_records(self, table_id):
         """分页读取表中所有记录"""
         url = f"{self.base}/bitable/v1/apps/{FEISHU_BASE_TOKEN}/tables/{table_id}/records"
@@ -514,7 +554,7 @@ def main():
     feishu.get_tenant_token()
     _T["2-飞书认证"] = _time.time() - _t0; _t0 = _time.time()
 
-    # 3. 影票：定位/创建当月表
+    # 3. 定位当月表（list_tables 只调一次，后续复用）
     tables = feishu.list_tables()
     ticket_table_name = f"影票明细_{month_str}"
     if ticket_table_name in tables:
@@ -523,162 +563,142 @@ def main():
     else:
         ticket_table_id = feishu.create_table(ticket_table_name, TICKET_FIELDS)
         print(f"[Feishu] 已创建当月表: {ticket_table_name}")
-
     _T["3-定位当月表"] = _time.time() - _t0; _t0 = _time.time()
 
-    # 4. 影票去重并写入（按订单编号+座位去重，避免多座位订单只导入第一条）
-    existing_records = feishu.fetch_all_records(ticket_table_id)
+    # 近三天窗口：去重和汇总共用，只查近三天，不读全表
+    recent_dates = set(today - datetime.timedelta(days=i) for i in range(3))
+    recent_months = set(d.strftime("%Y%m") for d in recent_dates)
+    since_date = today - datetime.timedelta(days=3)
+    since_ms = int(datetime.datetime.combine(since_date, datetime.time.min, tzinfo=CN_TZ).timestamp() * 1000)
+
+    def _day_ms(d):
+        return int(datetime.datetime.combine(d, datetime.time.min, tzinfo=CN_TZ).timestamp()) * 1000
+
+    def _text(v):
+        if isinstance(v, list):
+            return v[0].get("text", "") if v else ""
+        return v
+
+    def _accum_ticket(fv, summary):
+        dv = fv.get("放映日期")
+        cinema = _text(fv.get("所属影院"))
+        if not dv or not cinema:
+            return
+        dt = datetime.datetime.fromtimestamp(int(dv) / 1000, tz=CN_TZ)
+        if dt.date() not in recent_dates:
+            return
+        key = (_day_ms(dt.date()), str(cinema))
+        s = summary.setdefault(key, {"orders": set(), "people": 0, "boxoffice": 0.0})
+        on = _text(fv.get("订单编号"))
+        if on:
+            s["orders"].add(str(on))
+        s["people"] += 1
+        pay = fv.get("实付金额(元)")
+        if pay is not None:
+            s["boxoffice"] += float(pay)
+
+    def _accum_coupon(fv, summary):
+        dv = fv.get("兑换时间")
+        cinema = _text(fv.get("消费影院"))
+        if not dv or not cinema:
+            return
+        dt = datetime.datetime.fromtimestamp(int(dv) / 1000, tz=CN_TZ)
+        if dt.date() not in recent_dates:
+            return
+        key = (_day_ms(dt.date()), str(cinema))
+        s = summary.setdefault(key, {"count": 0, "total": 0.0, "people": 0})
+        s["count"] += 1
+        fee = fv.get("消费总额")
+        if fee is not None:
+            s["total"] += float(fee)
+        s["people"] += 1
+
+    # 4. 影票：只查近三天记录，去重+汇总共用
+    ticket_summary = {}
     existing_ticket_keys = set()
-    for item in existing_records:
-        fv = item.get("fields", {})
-        order_no = fv.get("订单编号")
-        if isinstance(order_no, list):
-            order_no = order_no[0].get("text", "") if order_no else ""
-        seat = fv.get("座位")
-        if isinstance(seat, list):
-            seat = seat[0].get("text", "") if seat else ""
-        existing_ticket_keys.add((str(order_no), str(seat)))
+    for tname, tid in tables.items():
+        if not tname.startswith("影票明细_"):
+            continue
+        if tname.replace("影票明细_", "") not in recent_months:
+            continue
+        recs = feishu.search_since(tid, "放映日期", since_ms)
+        print(f"[Feishu] 近三天 {tname}: {len(recs)} 条")
+        for item in recs:
+            fv = item.get("fields", {})
+            existing_ticket_keys.add((str(_text(fv.get("订单编号"))), str(_text(fv.get("座位")))))
+            _accum_ticket(fv, ticket_summary)
+
     new_ticket_records = []
     for t in ticket_detail:
         cell = ticket_to_cell(t)
         if not cell:
             continue
-        order_no = str(cell.get("订单编号", ""))
-        seat = str(cell.get("座位", ""))
-        key = (order_no, seat)
-        if order_no and key in existing_ticket_keys:
+        key = (str(cell.get("订单编号", "")), str(cell.get("座位", "")))
+        if key[0] and key in existing_ticket_keys:
             continue
         new_ticket_records.append({"fields": cell})
         existing_ticket_keys.add(key)
+        _accum_ticket(cell, ticket_summary)  # 新写入记录同步计入汇总
     print(f"[Feishu] 影票待写入: {len(new_ticket_records)} 条（已按订单+座位去重）")
     if new_ticket_records:
         feishu.batch_create_records(ticket_table_id, new_ticket_records)
-    _T["4-影票去重+写入"] = _time.time() - _t0; _t0 = _time.time()
+    _T["4-影票查询去重写入"] = _time.time() - _t0; _t0 = _time.time()
 
-    # 5. 兑换券去重并写入
-    existing_coupon = feishu.fetch_existing_order_nos(FEISHU_COUPON_TABLE_ID, "订单编号")
+    # 5. 兑换券：只查近三天记录，去重+汇总共用
+    coupon_summary = {}
+    recent_coupon = feishu.search_since(FEISHU_COUPON_TABLE_ID, "兑换时间", since_ms)
+    print(f"[Feishu] 近三天兑换券: {len(recent_coupon)} 条")
+    existing_coupon = set()
+    for item in recent_coupon:
+        fv = item.get("fields", {})
+        on = _text(fv.get("订单编号"))
+        if on:
+            existing_coupon.add(str(on))
+        _accum_coupon(fv, coupon_summary)
+
     new_coupon_records = []
-    for c in coupons:
-        order_no = c.get("orderNo")
+    for cc in coupons:
+        order_no = cc.get("orderNo")
         if order_no and order_no in existing_coupon:
             continue
-        cell = coupon_to_cell(c)
+        cell = coupon_to_cell(cc)
         if cell:
             new_coupon_records.append({"fields": cell})
             if order_no:
                 existing_coupon.add(order_no)
+            _accum_coupon(cell, coupon_summary)  # 新写入记录同步计入汇总
     print(f"[Feishu] 兑换券待写入: {len(new_coupon_records)} 条（已去重）")
     if new_coupon_records:
         feishu.batch_create_records(FEISHU_COUPON_TABLE_ID, new_coupon_records)
-    _T["5-兑换券去重+写入"] = _time.time() - _t0; _t0 = _time.time()
+    _T["5-兑换券查询去重写入"] = _time.time() - _t0; _t0 = _time.time()
 
-    # 6. 近三天汇总校准（只计算当天+前两天，大幅缩短运行时间）
-    print("[Feishu] 开始近三天汇总校准...")
-    today = datetime.datetime.now(CN_TZ).date()
-    recent_dates = set()
-    for i in range(3):
-        recent_dates.add(today - datetime.timedelta(days=i))
-    recent_months = set(d.strftime("%Y%m") for d in recent_dates)
-    print(f"  近三天: {sorted(recent_dates)}, 涉及月份: {sorted(recent_months)}")
-    # 6a. 只读取涉及月份的影票明细表，并筛选近三天
-    all_tables = feishu.list_tables()
-    ticket_summary = {}  # {(日期ms, 影院): {"orders": set, "people": 0, "boxoffice": 0.0}}
-    for tname, tid in all_tables.items():
-        if not tname.startswith("影票明细_"):
-            continue
-        ym = tname.replace("影票明细_", "")
-        if ym not in recent_months:
-            continue
-        records = feishu.fetch_all_records(tid)
-        print(f"  读取 {tname}: {len(records)} 条")
-        for item in records:
-            fv = item.get("fields", {})
-            date_val = fv.get("放映日期")
-            cinema = fv.get("所属影院")
-            if isinstance(cinema, list):
-                cinema = cinema[0].get("text", str(cinema[0])) if cinema else None
-            if not date_val or not cinema:
-                continue
-            dt = datetime.datetime.fromtimestamp(int(date_val) / 1000, tz=CN_TZ)
-            if dt.date() not in recent_dates:
-                continue
-            day_ms = int(datetime.datetime.combine(dt.date(), datetime.time.min, tzinfo=CN_TZ).timestamp()) * 1000
-            key = (day_ms, str(cinema))
-            if key not in ticket_summary:
-                ticket_summary[key] = {"orders": set(), "people": 0, "boxoffice": 0.0}
-            order_no = fv.get("订单编号")
-            if order_no:
-                if isinstance(order_no, list):
-                    order_no = order_no[0].get("text", str(order_no[0]))
-                ticket_summary[key]["orders"].add(str(order_no))
-            ticket_summary[key]["people"] += 1
-            payment = fv.get("实付金额(元)")
-            if payment is not None:
-                ticket_summary[key]["boxoffice"] += float(payment)
-
-    # 6b. 从兑换券表读取数据，筛选近三天
-    coupon_summary = {}  # {(日期ms, 影院): {"count": 0, "total": 0.0, "people": 0}}
-    coupon_records = feishu.fetch_all_records(FEISHU_COUPON_TABLE_ID)
-    print(f"  读取兑换券: {len(coupon_records)} 条")
-    for item in coupon_records:
-        fv = item.get("fields", {})
-        date_val = fv.get("兑换时间")
-        cinema = fv.get("消费影院")
-        if isinstance(cinema, list):
-            cinema = cinema[0].get("text", str(cinema[0])) if cinema else None
-        if not date_val or not cinema:
-            continue
-        dt = datetime.datetime.fromtimestamp(int(date_val) / 1000, tz=CN_TZ)
-        if dt.date() not in recent_dates:
-            continue
-        day_ms = int(datetime.datetime.combine(dt.date(), datetime.time.min, tzinfo=CN_TZ).timestamp()) * 1000
-        key = (day_ms, str(cinema))
-        if key not in coupon_summary:
-            coupon_summary[key] = {"count": 0, "total": 0.0, "people": 0}
-        coupon_summary[key]["count"] += 1
-        total_fee = fv.get("消费总额")
-        if total_fee is not None:
-            coupon_summary[key]["total"] += float(total_fee)
-        coupon_summary[key]["people"] += 1
-
-    # 6c. 合并并写入汇总表
+    # 6. 近三天汇总：批量创建 + 批量更新
     all_keys = set(list(ticket_summary.keys()) + list(coupon_summary.keys()))
     existing_summary = feishu.fetch_summary_existing(FEISHU_SUMMARY_TABLE_ID)
-    to_create = []
-    to_update = []
+    to_create, to_update = [], []
     for key in sorted(all_keys):
         day_ms, cinema = key
-        t_data = ticket_summary.get(key, {"orders": set(), "people": 0, "boxoffice": 0.0})
-        c_data = coupon_summary.get(key, {"count": 0, "total": 0.0, "people": 0})
+        td = ticket_summary.get(key, {"orders": set(), "people": 0, "boxoffice": 0.0})
+        cd = coupon_summary.get(key, {"count": 0, "total": 0.0, "people": 0})
         fields = {
             "日期": day_ms,
             "所属影院": cinema,
-            "影票订单数": len(t_data["orders"]),
-            "影票人次": t_data["people"],
-            "影票票房": round(t_data["boxoffice"], 2),
-            "兑换券笔数": c_data["count"],
-            "兑换券总额": round(c_data["total"], 2),
-            "兑换券人次": c_data["people"],
+            "影票订单数": len(td["orders"]),
+            "影票人次": td["people"],
+            "影票票房": round(td["boxoffice"], 2),
+            "兑换券笔数": cd["count"],
+            "兑换券总额": round(cd["total"], 2),
+            "兑换券人次": cd["people"],
         }
         if key in existing_summary:
-            to_update.append((existing_summary[key], fields))
+            to_update.append({"record_id": existing_summary[key], "fields": fields})
         else:
             to_create.append({"fields": fields})
 
-    # 批量新增
-    created = 0
-    for i in range(0, len(to_create), 200):
-        batch = to_create[i:i+200]
-        feishu.batch_create_records(FEISHU_SUMMARY_TABLE_ID, batch)
-        created += len(batch)
-    # 逐条更新
-    updated = 0
-    for record_id, fields in to_update:
-        feishu.update_record(FEISHU_SUMMARY_TABLE_ID, record_id, fields)
-        updated += 1
+    created = feishu.batch_create_records(FEISHU_SUMMARY_TABLE_ID, to_create) if to_create else 0
+    updated = feishu.batch_update_records(FEISHU_SUMMARY_TABLE_ID, to_update) if to_update else 0
     print(f"[Feishu] 汇总近三天校准: 共 {len(all_keys)} 条，新增 {created} 条，更新 {updated} 条")
-
-    _T["6-近三天汇总校准"] = _time.time() - _t0
+    _T["6-汇总批量写入"] = _time.time() - _t0
 
     print("[Timing] ===== 脚本内部各阶段耗时 =====")
     _grand = 0
