@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>购票模式控制</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #f5f6f7;
+    padding: 16px;
+    color: #1f2329;
+  }
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+  }
+  .header h2 { font-size: 18px; font-weight: 600; }
+  .refresh-btn {
+    background: #3370ff;
+    color: white;
+    border: none;
+    padding: 6px 16px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .refresh-btn:hover { background: #2860e0; }
+  .refresh-btn:disabled { background: #a0c0ff; cursor: not-allowed; }
+  .mode-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  .mode-card {
+    background: white;
+    border-radius: 10px;
+    padding: 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    transition: all 0.2s;
+  }
+  .mode-card:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.12); }
+  .mode-name { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+  .mode-cinema { font-size: 12px; color: #8f959e; margin-bottom: 12px; }
+  .mode-status {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 10px;
+    font-size: 12px;
+    font-weight: 500;
+    margin-bottom: 12px;
+  }
+  .status-enabled { background: #e8f7ee; color: #00b42a; }
+  .status-disabled { background: #ffece8; color: #f53f3f; }
+  .toggle-btn {
+    width: 100%;
+    padding: 8px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    transition: all 0.2s;
+  }
+  .toggle-btn.enable { background: #00b42a; color: white; }
+  .toggle-btn.enable:hover { background: #009a24; }
+  .toggle-btn.disable { background: #f53f3f; color: white; }
+  .toggle-btn.disable:hover { background: #d93636; }
+  .toggle-btn:disabled { background: #c9cdd4; cursor: not-allowed; }
+  .loading { text-align: center; padding: 40px; color: #8f959e; }
+  .toast {
+    position: fixed;
+    top: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0,0,0,0.8);
+    color: white;
+    padding: 10px 20px;
+    border-radius: 6px;
+    font-size: 14px;
+    z-index: 1000;
+    display: none;
+  }
+  .toast.show { display: block; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h2>购票模式控制</h2>
+  <button class="refresh-btn" onclick="loadStatus()">刷新状态</button>
+</div>
+<div id="modeGrid" class="mode-grid">
+  <div class="loading">加载中...</div>
+</div>
+<div id="toast" class="toast"></div>
+
+<script>
+const API_BASE = 'https://hlxh-fi-control-iokxmcsllt.cn-hangzhou.fcapp.run';
+
+function showToast(msg) {
+  const toast = document.getElementById('toast');
+  toast.textContent = msg;
+  toast.classList.add('show');
+  setTimeout(() => toast.classList.remove('show'), 2000);
+}
+
+async function loadStatus() {
+  const grid = document.getElementById('modeGrid');
+  const btn = document.querySelector('.refresh-btn');
+  btn.disabled = true;
+  btn.textContent = '刷新中...';
+  try {
+    const res = await fetch(API_BASE + '?action=status');
+    const data = await res.json();
+    if (data.success && data.modes) {
+      renderModes(data.modes);
+    } else {
+      grid.innerHTML = '<div class="loading">加载失败，请重试</div>';
+    }
+  } catch (e) {
+    grid.innerHTML = '<div class="loading">网络错误：' + e.message + '</div>';
+  }
+  btn.disabled = false;
+  btn.textContent = '刷新状态';
+}
+
+function renderModes(modes) {
+  const grid = document.getElementById('modeGrid');
+  // 按影院排序：胜利广场在前，百老汇在后；每个影院微信支付在前
+  const order = [4, 2, 3, 1];
+  const sorted = order.map(id => modes.find(m => m.id === id)).filter(Boolean);
+  grid.innerHTML = sorted.map(m => `
+    <div class="mode-card">
+      <div class="mode-name">${m.name}</div>
+      <div class="mode-cinema">${m.cinema} · ${m.pay_type}</div>
+      <div class="mode-status ${m.is_disabled === 0 ? 'status-enabled' : 'status-disabled'}">
+        ${m.is_disabled === 0 ? '● 启用中' : '● 已禁用'}
+      </div>
+      <button class="toggle-btn ${m.is_disabled === 0 ? 'disable' : 'enable'}" 
+              onclick="toggleMode(${m.id}, ${m.is_disabled === 0 ? 1 : 0})"
+              id="btn-${m.id}">
+        ${m.is_disabled === 0 ? '点击禁用' : '点击启用'}
+      </button>
+    </div>
+  `).join('');
+}
+
+async function toggleMode(id, targetState) {
+  const btn = document.getElementById('btn-' + id);
+  btn.disabled = true;
+  btn.textContent = '操作中...';
+  try {
+    const res = await fetch(API_BASE + '?action=toggle&id=' + id);
+    const data = await res.json();
+    if (data.success) {
+      showToast('操作成功：' + data.from + ' → ' + data.to);
+      setTimeout(loadStatus, 500);
+    } else {
+      showToast('操作失败：' + (data.message || '未知错误'));
+      btn.disabled = false;
+      btn.textContent = targetState === 0 ? '点击启用' : '点击禁用';
+    }
+  } catch (e) {
+    showToast('网络错误：' + e.message);
+    btn.disabled = false;
+    btn.textContent = targetState === 0 ? '点击启用' : '点击禁用';
+  }
+}
+
+loadStatus();
+</script>
+</body>
+</html>
